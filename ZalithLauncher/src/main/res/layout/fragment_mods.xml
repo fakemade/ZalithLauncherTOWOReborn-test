@@ -147,7 +147,6 @@
                         android:layout_width="@dimen/_18sdp"
                         android:layout_height="@dimen/_18sdp"
                         android:layout_marginEnd="@dimen/_4sdp"
-                        android:visibility="gone"
                         android:contentDescription="CurseForge"
                         android:src="@drawable/ic_curseforge" />
 
@@ -162,7 +161,6 @@
                         android:paddingHorizontal="@dimen/_12sdp"
                         android:paddingVertical="@dimen/_6sdp"
                         android:text="CurseForge"
-                        android:visibility="gone"
                         android:textColor="@color/primary_text"
                         android:textSize="@dimen/_10sdp"
                         android:textStyle="bold"

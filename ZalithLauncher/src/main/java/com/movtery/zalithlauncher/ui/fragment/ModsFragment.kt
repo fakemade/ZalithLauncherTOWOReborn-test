@@ -15,6 +15,7 @@ import com.movtery.anim.AnimPlayer
 import com.movtery.anim.animations.Animations
 import com.movtery.zalithlauncher.R
 import com.movtery.zalithlauncher.databinding.FragmentModsBinding
+import com.movtery.zalithlauncher.feature.mod.CurseForgeUpdateChecker
 import com.movtery.zalithlauncher.feature.mod.ModJarIconHelper
 import com.movtery.zalithlauncher.feature.mod.ModToggleHandler
 import com.movtery.zalithlauncher.feature.mod.ModUtils
@@ -436,12 +437,94 @@ class ModsFragment : FragmentWithAnim(R.layout.fragment_mods) {
 
     private fun runCurseForgeUpdateCheck() {
         mActiveUpdateSource = UpdateSource.CURSEFORGE
-        mUpdateResults.clear()
-        mShowUpdatesOnly = false
-        binding.showUpdatesOnly.isChecked = false
-        binding.showUpdatesOnly.visibility = View.GONE
-        applyUpdateResultsToVisibleItems()
-        Toast.makeText(requireContext(), "CurseForge update checker not wired yet", Toast.LENGTH_SHORT).show()
+        closeMultiSelect()
+        val dialog = ZHTools.showTaskRunningDialog(requireContext())
+
+        Task.runTask {
+            val modFiles = File(mRootPath).listFiles()
+                ?.filter { file ->
+                    file.isFile && (
+                            file.name.endsWith(ModUtils.JAR_FILE_SUFFIX) ||
+                                    file.name.endsWith(ModUtils.DISABLE_JAR_FILE_SUFFIX)
+                            )
+                }
+                .orEmpty()
+
+            val updateAvailable = mutableListOf<String>()
+            val upToDate = mutableListOf<String>()
+            val unknown = mutableListOf<String>()
+            val statusMap = mutableMapOf<String, UpdateUiInfo>()
+
+            for (file in modFiles) {
+                val result = runCatching {
+                    CurseForgeUpdateChecker.checkForUpdate(
+                        context = requireContext(),
+                        file = file,
+                        minecraftVersion = mMinecraftVersion
+                    )
+                }.onFailure {
+                    com.movtery.zalithlauncher.feature.log.Logging.e(
+                        "ModsFragment",
+                        "CurseForge update check failed for ${file.absolutePath}",
+                        it
+                    )
+                }.getOrNull()
+
+                val label = result?.projectTitle
+                    ?: ModJarIconHelper.read(requireContext(), file)?.displayName
+                    ?: file.name
+
+                when (result?.status) {
+                    CurseForgeUpdateChecker.UpdateStatus.UPDATE_AVAILABLE -> {
+                        val detail = "Update: ${result.installedVersion ?: "?"} → ${result.latestVersion ?: "?"}"
+                        updateAvailable.add("$label (${result.installedVersion ?: "?"} → ${result.latestVersion ?: "?"})")
+                        statusMap[file.absolutePath] = UpdateUiInfo(UpdateUiStatus.UPDATE_AVAILABLE, detail)
+                    }
+
+                    CurseForgeUpdateChecker.UpdateStatus.UP_TO_DATE -> {
+                        upToDate.add(label)
+                        statusMap[file.absolutePath] = UpdateUiInfo(UpdateUiStatus.UP_TO_DATE, "Up to date")
+                    }
+
+                    else -> {
+                        val reason = result?.reason ?: "Update status unknown"
+                        unknown.add(label)
+                        statusMap[file.absolutePath] = UpdateUiInfo(UpdateUiStatus.UNKNOWN, reason)
+                    }
+                }
+            }
+
+            ScanResult(updateAvailable, upToDate, unknown, statusMap)
+        }.ended(TaskExecutors.getAndroidUI()) { result ->
+            val safeResult = result ?: ScanResult(
+                mutableListOf(),
+                mutableListOf(),
+                mutableListOf(),
+                mutableMapOf()
+            )
+
+            mUpdateResults.clear()
+            mUpdateResults.putAll(safeResult.statuses)
+            mAllModItems = binding.fileRecyclerView.adapter.data.toMutableList()
+
+            val hasUpdates = safeResult.updates.isNotEmpty()
+            binding.showUpdatesOnly.visibility = if (hasUpdates) View.VISIBLE else View.GONE
+            if (!hasUpdates) mShowUpdatesOnly = false
+            binding.showUpdatesOnly.isChecked = mShowUpdatesOnly
+
+            applyUpdateResultsToVisibleItems()
+
+            Toast.makeText(
+                requireContext(),
+                "CurseForge updates: ${safeResult.updates.size}\nUp to date: ${safeResult.current.size}" +
+                        (if (safeResult.unknown.isNotEmpty()) "\nUnknown: ${safeResult.unknown.size}" else ""),
+                Toast.LENGTH_LONG
+            ).show()
+        }.onThrowable { e ->
+            Tools.showErrorRemote(e)
+        }.finallyTask(TaskExecutors.getAndroidUI()) {
+            dialog.dismiss()
+        }.execute()
     }
 
     private fun refreshAndReapply() {
