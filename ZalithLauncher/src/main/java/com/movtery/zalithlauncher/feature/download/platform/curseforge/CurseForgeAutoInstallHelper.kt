@@ -1,5 +1,6 @@
 package com.movtery.zalithlauncher.feature.download.platform.curseforge
 
+import android.content.Context
 import com.movtery.zalithlauncher.feature.download.InfoCache
 import com.movtery.zalithlauncher.feature.download.enums.DependencyType
 import com.movtery.zalithlauncher.feature.download.enums.ModLoader
@@ -8,6 +9,8 @@ import com.movtery.zalithlauncher.feature.download.item.DependenciesInfoItem
 import com.movtery.zalithlauncher.feature.download.item.InfoItem
 import com.movtery.zalithlauncher.feature.download.item.ModVersionItem
 import com.movtery.zalithlauncher.feature.download.item.VersionItem
+import com.movtery.zalithlauncher.feature.log.Logging
+import com.movtery.zalithlauncher.feature.mod.CurseForgeInstalledIndex
 import net.kdt.pojavlaunch.modloaders.modpacks.api.ApiHandler
 import java.io.File
 import java.io.FileInputStream
@@ -33,19 +36,14 @@ object CurseForgeAutoInstallHelper {
         infoItem: InfoItem,
         version: VersionItem,
         targetPath: File,
-        progressKey: String
+        progressKey: String,
+        context: Context? = null
     ) {
         val rootVersion = version as? ModVersionItem
             ?: throw IllegalArgumentException("CurseForge auto install requires ModVersionItem")
 
-        val targetDir = if (targetPath.isDirectory) {
-            targetPath
-        } else {
-            targetPath.parentFile ?: targetPath
-        }
-
+        val targetDir = resolveTargetDirectory(targetPath)
         val installedIndex = buildInstalledIndex(targetDir)
-
         val installPlan = resolveInstallPlan(
             api = api,
             rootInfoItem = infoItem,
@@ -53,10 +51,19 @@ object CurseForgeAutoInstallHelper {
             installedIndex = installedIndex
         )
 
+        Logging.i("CurseForgeAutoInstall", "Resolved ${installPlan.size} CurseForge file(s) for ${infoItem.title}")
+
         for ((_, entry) in installPlan) {
             val outputFile = File(targetDir, entry.versionItem.fileName)
             InstallHelper.downloadFile(entry.versionItem, outputFile, progressKey)
+            context?.let {
+                CurseForgeInstalledIndex.saveInstalled(it, outputFile, entry.infoItem, entry.versionItem)
+            }
         }
+    }
+
+    private fun resolveTargetDirectory(targetPath: File): File {
+        return if (targetPath.isDirectory) targetPath else targetPath.parentFile ?: targetPath
     }
 
     @Throws(Throwable::class)
@@ -94,61 +101,55 @@ object CurseForgeAutoInstallHelper {
     ) {
         if (!visited.add(currentInfoItem.projectId)) return
 
-        if (
-            isRoot || !isAlreadyInstalled(
-                installedIndex,
-                currentVersion.fileName,
-                currentVersion.fileHash
-            )
-        ) {
-            resolved[currentInfoItem.projectId] = ResolvedInstallEntry(
-                infoItem = currentInfoItem,
-                versionItem = currentVersion
-            )
+        if (isRoot || !isAlreadyInstalled(installedIndex, currentVersion.fileName, currentVersion.fileHash)) {
+            resolved[currentInfoItem.projectId] = ResolvedInstallEntry(currentInfoItem, currentVersion)
         }
 
-        val requiredDependencies = currentVersion.dependencies.filter {
-            it.dependencyType == DependencyType.REQUIRED
-        }
-
-        for (dependency in requiredDependencies) {
-            val dependencyInfo = resolveDependencyInfo(api, dependency) ?: continue
-            val dependencyVersion = resolveDependencyVersion(
-                api = api,
-                dependencyInfo = dependencyInfo,
-                parentVersion = currentVersion
-            ) ?: continue
-
-            if (isAlreadyInstalled(installedIndex, dependencyVersion.fileName, dependencyVersion.fileHash)) {
-                continue
+        currentVersion.dependencies
+            .asSequence()
+            .filter { it.dependencyType == DependencyType.REQUIRED }
+            .forEach { dependency ->
+                resolveDependency(api, dependency, currentVersion, resolved, visited, installedIndex)
             }
-
-            resolveRecursive(
-                api = api,
-                currentInfoItem = dependencyInfo,
-                currentVersion = dependencyVersion,
-                resolved = resolved,
-                visited = visited,
-                installedIndex = installedIndex,
-                isRoot = false
-            )
-        }
     }
 
     @Throws(Throwable::class)
-    private fun resolveDependencyInfo(
+    private fun resolveDependency(
         api: ApiHandler,
-        dependency: DependenciesInfoItem
-    ): InfoItem? {
-        val cached = InfoCache.DependencyInfoCache.get(dependency.projectId)
-        if (cached != null) return cached
+        dependency: DependenciesInfoItem,
+        parentVersion: ModVersionItem,
+        resolved: LinkedHashMap<String, ResolvedInstallEntry>,
+        visited: LinkedHashSet<String>,
+        installedIndex: InstalledIndex
+    ) {
+        val dependencyInfo = resolveDependencyInfo(api, dependency) ?: return
+        val dependencyVersion = resolveDependencyVersion(api, dependencyInfo, parentVersion) ?: return
+
+        if (isAlreadyInstalled(installedIndex, dependencyVersion.fileName, dependencyVersion.fileHash)) {
+            Logging.i("CurseForgeAutoInstall", "Skipping already installed dependency ${dependencyInfo.title}")
+            return
+        }
+
+        resolveRecursive(
+            api = api,
+            currentInfoItem = dependencyInfo,
+            currentVersion = dependencyVersion,
+            resolved = resolved,
+            visited = visited,
+            installedIndex = installedIndex,
+            isRoot = false
+        )
+    }
+
+    @Throws(Throwable::class)
+    private fun resolveDependencyInfo(api: ApiHandler, dependency: DependenciesInfoItem): InfoItem? {
+        InfoCache.DependencyInfoCache.get(dependency.projectId)?.let { return it }
 
         val response = CurseForgeCommonUtils.searchModFromID(api, dependency.projectId) ?: return null
         val hit = response.getAsJsonObject("data") ?: return null
         return CurseForgeCommonUtils.getInfoItem(hit, dependency.classify)
     }
 
-    @Throws(Throwable::class)
     private fun resolveDependencyVersion(
         api: ApiHandler,
         dependencyInfo: InfoItem,
@@ -156,29 +157,30 @@ object CurseForgeAutoInstallHelper {
     ): ModVersionItem? {
         val versions = CurseForgeModHelper.getModVersions(api, dependencyInfo, false)
             ?.filterIsInstance<ModVersionItem>()
+            ?.filter { it.fileName.isNotBlank() }
             ?: return null
 
         return versions
-            .filter { matchesParentMc(it, parentVersion) && matchesParentLoader(it, parentVersion) }
             .sortedWith(
-                compareByDescending<ModVersionItem> { scoreMcMatch(it, parentVersion) }
-                    .thenByDescending { scoreExactLoaderMatch(it, parentVersion) }
+                compareByDescending<ModVersionItem> { scoreCompatibility(it, parentVersion) }
+                    .thenByDescending { scoreReleaseType(it) }
                     .thenByDescending { it.uploadDate.time }
             )
-            .firstOrNull()
+            .firstOrNull { scoreCompatibility(it, parentVersion) > 0 }
     }
 
-    private fun matchesParentMc(candidate: ModVersionItem, parentVersion: ModVersionItem): Boolean {
-        if (candidate.mcVersions.isEmpty() || parentVersion.mcVersions.isEmpty()) return true
-        return candidate.mcVersions.any { it in parentVersion.mcVersions }
-    }
+    private fun scoreCompatibility(candidate: ModVersionItem, parentVersion: ModVersionItem): Int {
+        var score = 0
 
-    private fun matchesParentLoader(candidate: ModVersionItem, parentVersion: ModVersionItem): Boolean {
-        val parentLoaders = normalizeLoaders(parentVersion.modloaders)
-        val candidateLoaders = normalizeLoaders(candidate.modloaders)
+        val mcScore = scoreMcMatch(candidate, parentVersion)
+        if (mcScore == 0) return 0
+        score += mcScore * 100
 
-        if (parentLoaders.isEmpty() || candidateLoaders.isEmpty()) return true
-        return candidateLoaders.any { it in parentLoaders }
+        val loaderScore = scoreLoaderMatch(candidate, parentVersion)
+        if (loaderScore == 0) return 0
+        score += loaderScore * 10
+
+        return score
     }
 
     private fun scoreMcMatch(candidate: ModVersionItem, parentVersion: ModVersionItem): Int {
@@ -186,12 +188,21 @@ object CurseForgeAutoInstallHelper {
         return if (candidate.mcVersions.any { it in parentVersion.mcVersions }) 2 else 0
     }
 
-    private fun scoreExactLoaderMatch(candidate: ModVersionItem, parentVersion: ModVersionItem): Int {
+    private fun scoreLoaderMatch(candidate: ModVersionItem, parentVersion: ModVersionItem): Int {
         val parentLoaders = normalizeLoaders(parentVersion.modloaders)
         val candidateLoaders = normalizeLoaders(candidate.modloaders)
 
         if (parentLoaders.isEmpty() || candidateLoaders.isEmpty()) return 1
         return if (candidateLoaders.any { it in parentLoaders }) 2 else 0
+    }
+
+    private fun scoreReleaseType(candidate: ModVersionItem): Int {
+        return when (candidate.versionType.name.uppercase(Locale.ROOT)) {
+            "RELEASE", "STABLE" -> 3
+            "BETA" -> 2
+            "ALPHA" -> 1
+            else -> 0
+        }
     }
 
     private fun normalizeLoaders(loaders: List<ModLoader>): List<ModLoader> {
@@ -207,6 +218,7 @@ object CurseForgeAutoInstallHelper {
         val sha1Hashes = LinkedHashSet<String>()
 
         modsDir.listFiles()
+            ?.asSequence()
             ?.filter { file ->
                 file.isFile && (
                         file.name.endsWith(".jar", ignoreCase = true) ||
@@ -215,31 +227,18 @@ object CurseForgeAutoInstallHelper {
             }
             ?.forEach { file ->
                 fileNames.add(normalizeFileName(file.name))
-
-                val sha1 = runCatching { computeSha1(file) }.getOrNull()
-                if (!sha1.isNullOrBlank()) {
-                    sha1Hashes.add(sha1.lowercase(Locale.ROOT))
-                }
+                runCatching { computeSha1(file) }.getOrNull()?.let { sha1Hashes.add(it.lowercase(Locale.ROOT)) }
             }
 
         return InstalledIndex(fileNames, sha1Hashes)
     }
 
-    private fun isAlreadyInstalled(
-        index: InstalledIndex,
-        fileName: String?,
-        fileHash: String?
-    ): Boolean {
+    private fun isAlreadyInstalled(index: InstalledIndex, fileName: String?, fileHash: String?): Boolean {
         val normalizedName = normalizeFileName(fileName)
         val normalizedHash = fileHash?.trim()?.lowercase(Locale.ROOT)
 
-        if (!normalizedHash.isNullOrBlank() && normalizedHash in index.sha1Hashes) {
-            return true
-        }
-
-        if (!normalizedName.isNullOrBlank() && normalizedName in index.fileNames) {
-            return true
-        }
+        if (!normalizedHash.isNullOrBlank() && normalizedHash in index.sha1Hashes) return true
+        if (!normalizedName.isNullOrBlank() && normalizedName in index.fileNames) return true
 
         return false
     }
