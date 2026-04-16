@@ -60,6 +60,27 @@ jint JNI_OnLoad(JavaVM* vm, __attribute__((unused)) void* reserved) {
         hookExec();
         installLwjglDlopenHook();
         installEMUIIteratorMititgation();
+
+        // Disable SDL3 HIDAPI joystick backend to prevent double detection.
+        // When both HIDAPI and the Android Input API backend are active, they can both detect
+        // the same controller and trigger two SDL_JOYSTICKDEVICEADDED events. The second event
+        // causes crashes in SDL_UpdateJoysticks because SDL3 ends up with two conflicting
+        // joystick entries for the same physical device.
+        // Set this hint before any SDL_Init(SDL_INIT_JOYSTICK) call (Controlify via JNA, or
+        // our initializeControllerSubsystems). SDL hints are process-wide and persist.
+        void *sdl3_handle_hint = dlopen("libSDL3.so", RTLD_NOW);
+        if (sdl3_handle_hint != NULL) {
+            typedef int (*SDL_SetHint_t)(const char *name, const char *value);
+            SDL_SetHint_t sdl_set_hint = (SDL_SetHint_t)dlsym(sdl3_handle_hint, "SDL_SetHint");
+            if (sdl_set_hint != NULL) {
+                sdl_set_hint("SDL_JOYSTICK_HIDAPI", "0");
+                __android_log_print(ANDROID_LOG_INFO, "SDL_Hint", "Disabled HIDAPI joystick backend to prevent double detection");
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, "SDL_Hint", "SDL_SetHint symbol not found");
+            }
+        } else {
+            __android_log_print(ANDROID_LOG_WARN, "SDL_Hint", "libSDL3.so not loaded yet, HIDAPI hint not set");
+        }
     }
 
     if(pojav_environ->dalvikJavaVMPtr == vm) {
@@ -592,10 +613,19 @@ static void registerFunctions(JNIEnv *env) {
 
 static inline void initSubsystem(void) {
     typedef int (*SDL_Init_Func)(uint32_t flags);
+    typedef int (*SDL_SetHint_Func)(const char *name, const char *value);
     void* handle = dlopen("libSDL3.so", RTLD_NOW);
     if (handle == NULL) {
         __android_log_print(ANDROID_LOG_WARN, "SDL_Init", "Failed to dlopen libSDL3.so: %s", dlerror());
         return;
+    }
+    // Disable HIDAPI before SDL_Init to prevent double detection (Android Input API + HIDAPI
+    // would both detect the same controller, causing two SDL_JOYSTICKDEVICEADDED events and
+    // a crash in SDL_UpdateJoysticks).
+    SDL_SetHint_Func SDL_SetHint = (SDL_SetHint_Func)dlsym(handle, "SDL_SetHint");
+    if (SDL_SetHint != NULL) {
+        SDL_SetHint("SDL_JOYSTICK_HIDAPI", "0");
+        __android_log_print(ANDROID_LOG_INFO, "SDL_Init", "Disabled HIDAPI joystick backend before SDL_Init");
     }
     SDL_Init_Func SDL_Init = (SDL_Init_Func)dlsym(handle, "SDL_Init");
     if (SDL_Init == NULL) {

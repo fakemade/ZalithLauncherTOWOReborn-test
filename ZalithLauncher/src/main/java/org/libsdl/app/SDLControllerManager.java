@@ -14,6 +14,7 @@ import java.util.List;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -245,13 +246,13 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
             firstPollDone = true;
         }
 
-        // When called from a non-Android thread (e.g. Minecraft's HotSpot JVM Render thread),
-        // skip the nativeAddJoystick/nativeRemoveJoystick calls. Those JNI callbacks cause
-        // TLS key collision between ART and HotSpot, corrupting the JNIEnv and crashing in
-        // SDL_UpdateJoysticks. Controllers detected via SDL3's HIDAPI path still work.
-        if (Looper.myLooper() == null) {
-            return;
-        }
+        // When called from a HotSpot JVM thread (e.g. Minecraft's Render thread), Looper is null.
+        // We cannot call nativeAddJoystick/nativeRemoveJoystick directly from that thread because
+        // the JNI transition causes a TLS key collision between ART and HotSpot, corrupting the
+        // cached JNIEnv and crashing in SDL_UpdateJoysticks.
+        // Instead, post those JNI calls to the Android main thread where ART is always safe.
+        // We still track the joystick in mJoysticks immediately so duplicate polls don't re-post.
+        final boolean hasLooper = Looper.myLooper() != null;
 
         int[] deviceIds = InputDevice.getDeviceIds();
 
@@ -288,10 +289,31 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
                         }
                     }
 
+                    // Add to tracking list now so subsequent polls (from the same Render thread)
+                    // see this joystick as already-known and don't post a duplicate.
                     mJoysticks.add(joystick);
-                    SDLControllerManager.nativeAddJoystick(joystick.device_id, joystick.name, joystick.desc,
-                            getVendorId(joystickDevice), getProductId(joystickDevice),
-                            getButtonMask(joystickDevice), joystick.axes.size(), getAxisMask(joystick.axes), joystick.hats.size()/2, can_rumble);
+
+                    final int fDeviceId = joystick.device_id;
+                    final String fName = joystick.name;
+                    final String fDesc = joystick.desc;
+                    final int fVendorId = getVendorId(joystickDevice);
+                    final int fProductId = getProductId(joystickDevice);
+                    final int fButtonMask = getButtonMask(joystickDevice);
+                    final int fAxesSize = joystick.axes.size();
+                    final int fAxisMask = getAxisMask(joystick.axes);
+                    final int fHatsSize = joystick.hats.size() / 2;
+                    final boolean fCanRumble = can_rumble;
+
+                    if (hasLooper) {
+                        SDLControllerManager.nativeAddJoystick(fDeviceId, fName, fDesc,
+                                fVendorId, fProductId, fButtonMask, fAxesSize, fAxisMask, fHatsSize, fCanRumble);
+                    } else {
+                        // Post to main thread: safe ART context, no TLS collision risk
+                        new Handler(Looper.getMainLooper()).post(() ->
+                            SDLControllerManager.nativeAddJoystick(fDeviceId, fName, fDesc,
+                                    fVendorId, fProductId, fButtonMask, fAxesSize, fAxisMask, fHatsSize, fCanRumble)
+                        );
+                    }
                 }
             }
         }
@@ -314,12 +336,20 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
 
         if (removedDevices != null) {
             for (int device_id : removedDevices) {
-                SDLControllerManager.nativeRemoveJoystick(device_id);
+                // Remove from tracking immediately so the next poll doesn't re-add
                 for (int i = 0; i < mJoysticks.size(); i++) {
                     if (mJoysticks.get(i).device_id == device_id) {
                         mJoysticks.remove(i);
                         break;
                     }
+                }
+                if (hasLooper) {
+                    SDLControllerManager.nativeRemoveJoystick(device_id);
+                } else {
+                    final int fRemoveId = device_id;
+                    new Handler(Looper.getMainLooper()).post(() ->
+                        SDLControllerManager.nativeRemoveJoystick(fRemoveId)
+                    );
                 }
             }
         }
