@@ -474,6 +474,9 @@ public final class JREUtils {
         }
 
         userArgs.add("-XX:ActiveProcessorCount=" + java.lang.Runtime.getRuntime().availableProcessors());
+        // Redirect JNA temp extraction to internal storage to avoid Android namespace restrictions
+        // that block loading native libraries from external storage paths
+        userArgs.add("-Djna.tmpdir=" + PathManager.DIR_CACHE.getAbsolutePath());
     }
 
     private static void addPureHybridCacheOverrides(List<String> userArgs) {

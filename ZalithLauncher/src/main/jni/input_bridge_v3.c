@@ -586,7 +586,28 @@ static void registerFunctions(JNIEnv *env) {
                             sizeof(critical_fcns)/sizeof(critical_fcns[0]));
 }
 
+#define SDL_INIT_JOYSTICK   0x00000200u
+#define SDL_INIT_GAMEPAD    0x00002000u
+#define SDL_INIT_EVENTS     0x00004000u
+
+static inline void initSubsystem(void) {
+    typedef int (*SDL_Init_Func)(uint32_t flags);
+    void* handle = dlopen("libSDL3.so", RTLD_NOW);
+    if (handle == NULL) {
+        __android_log_print(ANDROID_LOG_WARN, "SDL_Init", "Failed to dlopen libSDL3.so: %s", dlerror());
+        return;
+    }
+    SDL_Init_Func SDL_Init = (SDL_Init_Func)dlsym(handle, "SDL_Init");
+    if (SDL_Init == NULL) {
+        __android_log_print(ANDROID_LOG_WARN, "SDL_Init", "Failed to find SDL_Init symbol");
+        return;
+    }
+    int result = SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_JOYSTICK | SDL_INIT_EVENTS);
+    __android_log_print(ANDROID_LOG_INFO, "SDL_Init", "SDL_Init result: %d", result);
+}
+
 JNIEXPORT void JNICALL
 Java_net_kdt_pojavlaunch_Tools_00024SDL_initializeControllerSubsystems(JNIEnv *env, jclass clazz) {
-    // TODO: implement initializeControllerSubsystems()
+    (void)env; (void)clazz;
+    initSubsystem();
 }
