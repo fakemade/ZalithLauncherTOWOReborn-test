@@ -304,6 +304,13 @@ JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(JNI
 #endif
 
     JNIEnv *dalvikEnv;
+    // Attach to the Android (ART) JVM to call clipboard APIs.
+    // We intentionally do NOT call DetachCurrentThread afterwards: SDL3 also attaches the
+    // Render thread to ART and caches the JNIEnv in its mThreadKey TLS slot. Calling
+    // DetachCurrentThread here invalidates that cached env, causing the next
+    // SDL_UpdateJoysticks() call to use a stale pointer and crash with SIGSEGV at 0xb8
+    // (DeleteLocalRef on a null JNINativeInterface_). The ART attachment for this thread
+    // is safe to leave live — ART will clean it up when the thread exits.
     (*pojav_environ->dalvikJavaVMPtr)->AttachCurrentThread(pojav_environ->dalvikJavaVMPtr, &dalvikEnv, NULL);
     assert(dalvikEnv != NULL);
     assert(pojav_environ->bridgeClazz != NULL);
@@ -317,13 +324,18 @@ JNIEXPORT jstring JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeClipboard(JNI
     }
 
     LOGD("Clipboard: Calling 2nd\n");
-    jstring pasteDst = convertStringJVM(dalvikEnv, env, (jstring) (*dalvikEnv)->CallStaticObjectMethod(dalvikEnv, pojav_environ->bridgeClazz, pojav_environ->method_accessAndroidClipboard, action, copyDst));
+    // Extract the result and delete its ART local ref explicitly, since we are no longer
+    // relying on DetachCurrentThread to clean up ART's local ref table for this thread.
+    jstring artResult = (jstring) (*dalvikEnv)->CallStaticObjectMethod(dalvikEnv, pojav_environ->bridgeClazz, pojav_environ->method_accessAndroidClipboard, action, copyDst);
+    jstring pasteDst = convertStringJVM(dalvikEnv, env, artResult);
+    if (artResult != NULL) {
+        (*dalvikEnv)->DeleteLocalRef(dalvikEnv, artResult);
+    }
 
     if (copySrc) {
         (*dalvikEnv)->DeleteLocalRef(dalvikEnv, copyDst);
         (*env)->ReleaseByteArrayElements(env, copySrc, (jbyte *)copySrcC, 0);
     }
-    (*pojav_environ->dalvikJavaVMPtr)->DetachCurrentThread(pojav_environ->dalvikJavaVMPtr);
     return pasteDst;
 }
 JNIEXPORT void JNICALL
@@ -348,9 +360,10 @@ JNIEXPORT jboolean JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSetInputRead
 
 JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSetGrabbing(__attribute__((unused)) JNIEnv* env, __attribute__((unused)) jclass clazz, jboolean grabbing) {
     JNIEnv *dalvikEnv;
+    // Same as nativeClipboard: do NOT call DetachCurrentThread — SDL3 shares this thread's
+    // ART attachment via mThreadKey and a detach here would corrupt SDL3's cached JNIEnv.
     (*pojav_environ->dalvikJavaVMPtr)->AttachCurrentThread(pojav_environ->dalvikJavaVMPtr, &dalvikEnv, NULL);
     (*dalvikEnv)->CallStaticVoidMethod(dalvikEnv, pojav_environ->bridgeClazz, pojav_environ->method_onGrabStateChanged, grabbing);
-    (*pojav_environ->dalvikJavaVMPtr)->DetachCurrentThread(pojav_environ->dalvikJavaVMPtr);
     pojav_environ->isGrabbing = grabbing;
 }
 
