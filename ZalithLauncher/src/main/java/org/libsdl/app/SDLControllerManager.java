@@ -14,6 +14,7 @@ import java.util.List;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
@@ -242,6 +243,14 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
             Log.i("SDL", "SDL detected! Enabling..");
             sDirectGamepadEnableHandler = null;
             firstPollDone = true;
+        }
+
+        // When called from a non-Android thread (e.g. Minecraft's HotSpot JVM Render thread),
+        // skip the nativeAddJoystick/nativeRemoveJoystick calls. Those JNI callbacks cause
+        // TLS key collision between ART and HotSpot, corrupting the JNIEnv and crashing in
+        // SDL_UpdateJoysticks. Controllers detected via SDL3's HIDAPI path still work.
+        if (Looper.myLooper() == null) {
+            return;
         }
 
         int[] deviceIds = InputDevice.getDeviceIds();
@@ -632,6 +641,12 @@ class SDLHapticHandler {
     }
 
     public void pollHapticDevices() {
+        // Same cross-JVM TLS collision issue as pollInputDevices: skip native JNI
+        // callbacks when called from a Minecraft/HotSpot JVM thread (no Android Looper).
+        // SDL.getContext() would also return null on a non-Android thread.
+        if (Looper.myLooper() == null) {
+            return;
+        }
 
         final int deviceId_VIBRATOR_SERVICE = 999999;
         boolean hasVibratorService = false;
